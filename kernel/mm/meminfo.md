@@ -1,5 +1,7 @@
 # 学习/proc/meminfo
 
+![pic/meminfo_all.png](pic/meminfo_all.png)
+
 ## MemTotal
 
 `MemTotal` = 物理内存 – firmware/BIOS 保留内存 - kernel 本身占用内存
@@ -84,6 +86,8 @@ Memory: 3918160K/4093400K available (18445K kernel code, 2373K rwdata, 5424K rod
 > 有些老设备只能访问低端内存，比如 16M 以下的内存，当应用程序发出一个 I/O 请求，DMA 的目的地址却是高端内存时（比如在 16M 以上），内核将在低端内存中分配一个临时 buffer 作为跳转，把位于高端内存的缓存数据复制到此处。这种额外的数据拷贝被称为“bounce buffering”，会降低 I/O 性能。大量分配的 bounce buffers 也会占用额外的内存。
 
 ## 用户进程
+
+![pic/meminfo_userspace.png](pic/meminfo_userspace.png)
 
 ### Hugepages
 
