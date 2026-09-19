@@ -367,7 +367,7 @@ NO.| 步骤            | TDX 函数           | 描述
   * **Single TD Assignment**：一个 TDMR 中的物理页最多只能分配给一个 TD
   * **Secure EPT Consistency**：任何在 Secure EPT 中映射的私有 TD 页大小与它在 PAMT 中的页大小属性一致
 
-#### 8.3.1 PAMT Entry
+#### 8.3.1 Leaf PAMT Entry
 * 一个 PAMT 条目持有一个单独的物理页的元数据。
 * 页大小可能是 4KB、2MB 或 1GB，取决于 PAMT level。
 * Table 8.1: High-Level View of a PAMT Entry
@@ -400,20 +400,24 @@ BEPOCH | 根据设计，`TDCS.TD_EPOCH` 的值由 `TDH.MEM.RANGE.BLOCK` 采样�
 
 页面类型 | PAMT 层级 | 关联的 TDX 页面 | 描述
 ---------|----------|----------------------|---------------
-PT_NDA   | 任何     | 取决于高一级的 PAMT 层级类型 | 物理页未直接分配（Not Directly Assigned）给 TDX module，大小和 PAMT 级别
+PT_NDA   | 任何     | 取决于高一级的 PAMT 层级类型 | 物理页未直接分配（Not Directly Assigned）给 TDX module，大小和 PAMT 级别。该页可能是更高层级中分配给 TDX module 的更大页面的一部分，也可能包含更低层级中分配给 TDX module 的更小页面
 PT_RSVD  | PAMT_4K  | 无 | 该物理页保留给非-TDX 用途。TDX module 不允许转换该页为其他页面类型。该页可被 host VMM 用于其他任何目的。被用于实现 TDMRs 内的保留区
 PT_REG   | 任何     | TD 私有页面 | 在 PAMT 级别中的物理页，持有 TD 私有内存，通过 Secure EPT 映射到 guest TD GPA 空间
+PT_PR    | PAMT_2M,PAMT_1G | TD 私有页面 | 此 PAMT 层级（2M 或 1G）上的物理页承载着一块已移除（removed）的 TD 私有内存，该内存正在等待页面移除（通过 `TDH.MEM.PAGE.REMOVE`）或回收（通过 `TDH.PHYMEM.PAGE.RECLAIM`）流程的完成。**Enumeration**：`PT_PR` 仅适用于使用 ACT 保护 TDX 内存的平台，具体由 `TDX_FEATURES0.ACT`（bit 14）枚举确定
 PT_TDR   | PAMT_4K  | TDR        | TDR（root）控制结构页面
 PT_TDCX  | PAMT_4K  | TDCX       | 多页的 TDCS 控制结构中的一个物理页
 PT_TDVPR | PAMT_4K  | TDVPR      | 多页的 TDVPS 控制结构的根页面
 PT_TDVPX | PAMT_4K  | TDVPX      | 多页的 TDVPS 控制结构中的非根页面
 PT_EPT   | PAMT_4K  | Secure EPT | Secure EPT page
+PT_TR    | PAMT_4K  | - | 一个当前没有 GPA 映射、但在被分配用于任何用途之前必须进行 TLB 跟踪（TLB tracked）的物理页。**Enumeration**：`PT_TR` 仅适用于实现了 *无跟踪页面大小调整* 功能的 TDX module，具体由 `TDX_FEATURES0.NON_BLOCKING_RESIZE`（bit 35）枚举确定
+PT_PAMT  | PATM_2M（仅动态 PAMT）| PAMT | 如果支持动态 PAMT，则 `PT_PAMT` 是 *非叶子 PAMT 条目* 的页类型，该条目指向一对 PAMT 页
+TDX Connect Types | - | - | TDX Connect 页面类型在 [TDX Connect Spec] 中定义
 
-#### 8.3.4 PAMT Hierarchy
+##### 8.3.3.3 静态 PAMT Hierarchy
 
 * 下面的表 8.3 显示了三个层次的 PAMT 条目的页面类型（PT），取决于页面是否分配给 TDX module 管理页面、页面是否映射到安全 EPT 中以及映射大小。
 
-![PAMT Hierarchy and Page Types](pic/pamt_and_pt.png)
+![Static PAMT Hierarchy and Page Types](pic/pamt_and_pt.png)
 ##### 注意
 * 如果一个 4KB 页面的 PAMT.PT 在 PAMT 的所有三个层级上都是 `PT_NDA`，该页面被认为是 **空闲** 的。
   * 任何尝试分配一个 HPA 到 TDX 的函数都做该检查。
@@ -446,6 +450,23 @@ typedef struct pamt_entry_s
 } pamt_entry_t;
 tdx_static_assert(sizeof(pamt_entry_t) == PAMT_ENTRY_SIZE_IN_BYTES, pamt_entry_t);
 ```
+
+#### 8.3.4 Dynamic PAMT
+
+##### 8.3.4.1 概览
+
+* TDX module 如果支持 Dynamic PAMT 模式，则可以配置为使用 Dynamic PAMT
+* Dynamic PAMT 通过以下方式优化内存空间：仅当存在已分配给 TDX 的 `4KB` 物理内存页时，才为保存 `PAMT_4K` 条目的 PAMT 页分配空间
+  * Dynamic PAMT 在逻辑上组织为树形结构，概念上类似于页表，用于保存分配给 TDX 的物理页的信息
+  * **树的节点** 是 **成对** 的 `4KB` PAMT 页，每个 PAMT 页对保存 `512` 个 PAMT 条目
+    * **非叶子（non-leaf）PAMT 条目** 指向更低层级的 PAMT 页对
+     * **叶子（leaf）PAMT 条目** 与分配给 TDX 的物理页相关联
+  *  **译注**：因为一个条目是 `16B`，故可以指向两个页，每个页面可保存 `256` 个 PAMT 条目
+* **在物理层面，`PAMT_1G` 和 `PAMT_2M` 层级为每个 TDMR 静态分配，与静态 PAMT 的做法相同；只有 `PAMT_4K` 层级是动态分配的**
+* 大小为 `4KB` 的 PAMT 页无法被 Dynamic PAMT 树映射，而它们是构建动态树部分所必需的
+  * 因此，使用一个 per-TDMR 静态分配的位图（bitmap）来控制 PAMT 页的分配
+
+![Dynamic PAMT Hierarchy and Page Types](pic/dyn_pamt_and_pt.png)
 
 ## 9 TD Private Memory Management
 
