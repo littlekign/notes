@@ -88,7 +88,7 @@ unlock:
 
 ### 找到 NOHZ 空闲负载均衡（ILB）
 
-#### “真正空闲”判断 `idle_rq()`
+#### `idle_rq()`：判断运行队列“真正空闲”
 * `idle_rq(struct rq *rq)` 判断一个运行队列是否处于绝对空闲状态，三个条件缺一不可：
 1. `rq->curr == rq->idle`：当前正在执行的进程是 idle 进程（`PID=0`）
 2. `!rq->nr_running`：运行队列中没有任何可运行的任务
@@ -157,120 +157,16 @@ static inline int find_new_ilb(void)
 * “内务处理”（Housekeeping）CPU 是那些没有被隔离、可以执行各种常规内核工作的 CPU
   * `HK_TYPE_KERNEL_NOISE` 是内务处理 CPU 的一种类型，它代表了没有被配置为 `nohz_full` 的 CPU 集合，可以安全地执行“内核噪声”类工作
 
-### NOHZ 空闲负载均衡的跨核唤醒
-* `nohz_flags(cpu)` 是一个 per CPU 的原子位掩码（`atomic_t`），用于记录该 CPU 上待处理的 NOHZ 均衡请求类型（如普通均衡 `NOHZ_BALANCE_KICK`、统计更新 `NOHZ_STATS_KICK` 等）
-  * 它充当了一个无锁工作队列，用于在多个繁忙 CPU 同时想唤醒同一个空闲 CPU 时进行仲裁
-  * kernel/sched/sched.h
-```cpp
-#define nohz_flags(cpu)         (&cpu_rq(cpu)->nohz_flags)
-```
-* `rq->nohz_csd`：一个 `call_single_data` 结构体，通过 `INIT_CSD()` 初始化为绑定 `nohz_csd_func` 回调。它是 SMP 异步 IPI 的载体
-```cpp
-void __init sched_init(void)
-{
-...
-                 INIT_CSD(&rq->nohz_csd, nohz_csd_func, rq);
-...
-}
-```
-
-#### 发起端：`kick_ilb()` 踢醒空闲 CPU
-* 若已到执行时机，则通过跨 CPU 的 SMP 函数调用（IPI）唤醒一个 CPU 来执行 NOHZ 负载均衡
-* 我们选取 `HK_TYPE_KERNEL_NOISE` 管家集合中的第一个空闲 CPU（如果存在）
-  * kernel/sched/fair.c
-```cpp
-/*
- * Kick a CPU to do the NOHZ balancing, if it is time for it, via a cross-CPU
- * SMP function call (IPI).
- *
- * We pick the first idle CPU in the HK_TYPE_KERNEL_NOISE housekeeping set
- * (if there is one).
- */
-static void kick_ilb(unsigned int flags)
-{
-        int ilb_cpu;
-        //仅当触发完整 ILB 时才递增 nohz.next_balance，仅更新统计信息时不做该递增
-        /*
-         * Increase nohz.next_balance only when if full ilb is triggered but
-         * not if we only update stats.
-         */
-        if (flags & NOHZ_BALANCE_KICK)
-                nohz.next_balance = jiffies+1;
-        //选举 ILB（空闲负载均衡器）CPU
-        ilb_cpu = find_new_ilb();
-        if (ilb_cpu < 0)
-                return;
-        //若 ilb_cpu 不存在新的 NOHZ 均衡工作项，例如 flags 中的所有位在 ilb_cpu 上均已置位，则无需处理
-        /*
-         * Don't bother if no new NOHZ balance work items for ilb_cpu,
-         * i.e. all bits in flags are already set in ilb_cpu.
-         */     
-        if ((atomic_read(nohz_flags(ilb_cpu)) & flags) == flags)
-                return; 
-        //对 rq::nohz_csd 的访问由 NOHZ_KICK_MASK 做串行保护；第一个置位标志的调用方持有该对象；
-        //由 nohz_csd_func() 完成清除操作
-        /*
-         * Access to rq::nohz_csd is serialized by NOHZ_KICK_MASK; he who sets
-         * the first flag owns it; cleared by nohz_csd_func().
-         */
-        flags = atomic_fetch_or(flags, nohz_flags(ilb_cpu));
-        //如果返回的旧值中已经含有 KICK 标志，说明目标 CPU 上已有未处理的 IPI 在排队
-        //为了避免 IPI 风暴，直接放弃本次发送
-        if (flags & NOHZ_KICK_MASK)
-                return;
-        //通过该方式，我们向处于空闲状态的目标 CPU 发送 IPI，执行 NOHZ 空闲负载均衡的软中断会在 IPI 返回前完成运行
-        /*
-         * This way we generate an IPI on the target CPU which
-         * is idle, and the softirq performing NOHZ idle load balancing
-         * will be run before returning from the IPI.
-         */
-        smp_call_function_single_async(ilb_cpu, &cpu_rq(ilb_cpu)->nohz_csd);
-}
-```
-* 使用 `atomic_fetch_or()` 做“分布式锁”：
-  * 多个繁忙 CPU 可能同时选中同一个空闲 CPU
-  * 通过原子操作，**第一个成功设置 `NOHZ_KICK_MASK` 的 CPU** 获得发送 IPI 的权利，其他 CPU 看到旧值中已有 `NOHZ_KICK_MASK` 后直接返回
-  * 这避免了多个 IPI 涌向同一个空闲 CPU
-* 异步发送（`_async` 后缀）CSD：繁忙 CPU 不需要等待空闲 CPU 处理完均衡再返回，避免了繁忙 CPU 因 IPI 响应而陷入阻塞延迟
-
-#### 接收端：`nohz_csd_func()` 空闲 CPU 被唤醒后做什么
-```cpp
-static void nohz_csd_func(void *info)
-{
-        struct rq *rq = info; 
-        int cpu = cpu_of(rq);
-        unsigned int flags;
-        //清除本 CPU 的 nohz_flags 中的 KICK 位（表示“正在处理”）
-        /*
-         * Release the rq::nohz_csd.
-         */
-        flags = atomic_fetch_andnot(NOHZ_KICK_MASK | NOHZ_NEWILB_KICK, nohz_flags(cpu));
-        WARN_ON(!(flags & NOHZ_KICK_MASK));
-        //再次检查当前 CPU 是否真的还处于空闲状态
-        rq->idle_balance = idle_cpu(cpu);
-        if (rq->idle_balance) {
-                rq->nohz_idle_balance = flags; //如果确实仍空闲，将 flags 暂存到 rq 中
-                __raise_softirq_irqoff(SCHED_SOFTIRQ); //然后触发调度软中断
-        }
-}
-```
-* 为什么必须二次检查 `idle_cpu`？
-  * 从繁忙 CPU 调用 `find_new_ilb()` 选出 `ilb_cpu`，到它发送 IPI，再到 IPI 真正抵达目标 CPU，这之间存在时间窗口
-  * 在这个窗口内，目标 CPU 可能已经被其他任务唤醒（`ttwu_pending` 或 `nr_running` 增加）
-  * 如果目标 CPU 不再空闲，则绝不能在当前上下文中触发 `SCHED_SOFTIRQ`，否则会在一个正在繁忙执行任务的 CPU 上强行插入负载均衡软中断，既浪费算力，也破坏调度公平
-* 内存屏障隐含：`atomic_fetch_andnot` 和 `atomic_fetch_or` 本身包含完整的内存屏障（full barrier），确保了 `nohz_flags` 的修改与 `rq` 其他状态的可见性顺序，是多核并发下的安全保障
-
-#### `check_cpu_capacity()` 检查 CPU 算力是否“受损”
-* `check_cpu_capacity()` 比较的是 “当前剩余可用算力” 与 “理论最大原生算力” 的比值
-  * `arch_scale_cpu_capacity(cpu)`：该 CPU 的原生最大算力（基于最高频率和微架构，通常归一化为 `1024`）
-  * `rq->cpu_capacity`：该 CPU 当前实时可用算力。它会因为以下 “侧活动（Side Activity）” 而动态衰减：
+### `check_cpu_capacity()` 检查 CPU 算力是否“受损”
+* `check_cpu_capacity()` 比较的是 **当前剩余可用算力** 与 **理论最大原生算力** 的比值
+  * `arch_scale_cpu_capacity(cpu)`：该 CPU 的 **原生最大算力**（基于最高频率和微架构，通常归一化为 `1024`）
+  * `rq->cpu_capacity`：该 CPU **当前实时可用算力**。它会因为以下 “侧活动（Side Activity）” 而动态衰减：
     * 运行了实时任务（RT/DL 类）抢占了大片时间片
     * 处理硬件中断（IRQ）或软中断
     * 遭遇温度限制（Thermal Throttling）导致降频
     * 被 cgroup 的 `cpu.max` 限制
   * `sd->imbalance_pct`：容忍阈值（通常为 `117`，即 `117%`）。用于防止算力因微小波动而频繁触发误判
-* 数学逻辑与判断条件（换算成百分比）：
-* 移项后，该条件等价于：
+* 数学逻辑与判断条件（换算成百分比）移项后等价于：
    ```c
   rq->cpu_capacity / arch_scale_cpu_capacity < 100 / sd->imbalance_pct
    ```
@@ -294,7 +190,7 @@ check_cpu_capacity(struct rq *rq, struct sched_domain *sd)
 * 在负载均衡中，如果某个 CPU 自身算力受损（比如被 RT 任务吃掉 `20%` 算力），调度器会放弃将新任务或重任务迁移给它，否则该任务会被“饿死”
 * 同时，如果算力受损的 CPU 上正跑着任务，它也会主动将这些任务推给其他算力健全的 CPU
 
-#### `check_cpu_capacity()` 检查是否存在“不匹配”的任务
+### `check_misfit_status()` 检查是否存在“不匹配”的任务
 * 什么是 **“Misfit Task”（不匹配任务）**？
   * 在异构（大小核）架构中，小核（LITTLE / E-core）算力有限，大核（big / P-core）算力充足
   * 当一个任务的 PELT 平均利用率（`util_avg`）超过了当前 CPU 的最大算力（`cpu_capacity`）时，该任务就被标记为“**Misfit**”
@@ -302,7 +198,7 @@ check_cpu_capacity(struct rq *rq, struct sched_domain *sd)
 * 谁来设置 `rq->misfit_task_load`？
   * 在 CFS 调度类的 `update_misfit_status()` 函数中，每当 **任务入队** 或 **进行 PELT 更新** 时，会检查当前 CPU 上运行的任务的 `util_avg`
   * 如果它大于该 CPU 的 `cpu_capacity`，`rq->misfit_task_load` 就被赋值为该任务的负载值，否则为 `0`
-##### 设计意图：
+#### 设计意图：
 * 一旦某个 CPU 上存在“Misfit Task”，调度器必须在负载均衡时采取紧急行动（Active Balance），将该任务迁移到算力更高的大核上去，以确保任务的性能（避免严重掉帧或延迟）
 * 这是智能手机和现代 PC 混合架构保证流畅度的核心机制
 ```cpp
@@ -615,10 +511,11 @@ static void nohz_balancer_kick(struct rq *rq)
          * 忙 tick 时刻，会更新忙状态统计信息。
          */
         nohz_balance_exit_idle(rq);
-
+        //nohz.has_blocked_load：系统中有某些 CPU 的 PELT 阻塞负载已经积压太久，需要被清理
+        //time_after(now, nohz.next_blocked)：检查是否已经到了清理这些阻塞负载的时间点
         if (READ_ONCE(nohz.has_blocked_load) &&
             time_after(now, READ_ONCE(nohz.next_blocked)))
-                flags = NOHZ_STATS_KICK;
+                flags = NOHZ_STATS_KICK; //注意：此时只置位了统计更新标志，并没有置位负载均衡标志
 
         /*
          * Most of the time system is not 100% busy. i.e nohz.nr_cpus > 0
@@ -636,7 +533,7 @@ static void nohz_balancer_kick(struct rq *rq)
          * 因此仅当到达执行时机时，才读取 nohz.nr_cpus
          */
         if (time_before(now, nohz.next_balance)) //如果还没到下一次负载均衡的时间
-                goto out; //先不急着决策，只处理可能的统计更新
+                goto out; //先不急着决策（只处理可能的统计更新）
         //如果当前系统中压根没有处于 NOHZ 空闲状态的 CPU（nohz.idle_cpus_mask 为空），
         //那么没必要折腾 ILB，直接返回。因为没有空闲 CPU 可以用来帮忙干活。
         /*
@@ -645,49 +542,56 @@ static void nohz_balancer_kick(struct rq *rq)
          */
         if (unlikely(cpumask_empty(nohz.idle_cpus_mask)))
                 return;
-
-        if (rq->nr_running >= 2) {
+        //进入核心决策区
+        //条件 1：当前 CPU 自身过载（最朴素的原因）
+        if (rq->nr_running >= 2) { //当前这个繁忙 CPU 上排队了至少 2 个任务
                 flags = NOHZ_STATS_KICK | NOHZ_BALANCE_KICK;
-                goto out;
+                goto out; //既然有任务在排队，说明这个 CPU 忙不过来了，赶紧唤醒一个空闲 CPU（ILB）来“分担火力”
         }
 
         rcu_read_lock();
-
+        //条件 2：当前 CPU 算力受损（容量衰减）
         sd = rcu_dereference_all(rq->sd);
         if (sd) {
                 /*
                  * If there's a runnable CFS task and the current CPU has reduced
                  * capacity, kick the ILB to see if there's a better CPU to run on:
                  */
+                //当前 CPU 上有 CFS 任务在运行，且该 CPU 的可用算力因 RT/IRQ 干扰或硬件降频而严重缩水
                 if (rq->cfs.h_nr_runnable >= 1 && check_cpu_capacity(rq, sd)) {
                         flags = NOHZ_STATS_KICK | NOHZ_BALANCE_KICK;
-                        goto unlock;
+                        goto unlock; //既然它变弱了，就赶紧把任务迁走
                 }
         }
-
+        //条件 3：非对称封装（ASYM_PACKING）—— 优先核心闲置
         sd = rcu_dereference_all(per_cpu(sd_asym_packing, cpu));
         if (sd) {
                 /*
                  * When ASYM_PACKING; see if there's a more preferred CPU
                  * currently idle; in which case, kick the ILB to move tasks
                  * around.
-                 *
+                 * 开启 ASYM_PACKING 时：检查是否存在优先级更高且当前处于空闲状态的 CPU；
+                 * 如果存在，则唤醒空闲负载均衡器（ILB），迁移任务。
                  * When balancing between cores, all the SMT siblings of the
                  * preferred CPU must be idle.
+                 * 在核心间做负载均衡时，目标优选 CPU 对应的所有 SMT 逻辑线程必须全部空闲。
                  */
                 for_each_cpu_and(i, sched_domain_span(sd), nohz.idle_cpus_mask) {
+                        //常见于 x86 架构（Intel ITMT），某些核心频率更高（“优先核心”）。
+                        //如果系统中存在一个比当前 CPU 更优（频率更高）的核心，且那个核心正好处于空闲状态
                         if (sched_asym(sd, i, cpu)) {
                                 flags = NOHZ_STATS_KICK | NOHZ_BALANCE_KICK;
-                                goto unlock;
+                                goto unlock; //既然有更好的空闲核心在“摸鱼”，赶紧把当前 CPU 上的任务踢过去，让任务跑得更快
                         }
                 }
         }
-
+        //条件 4：异构算力（ASYM_CPUCAPACITY）—— 检测到 Misfit 任务
         sd = rcu_dereference_all(per_cpu(sd_asym_cpucapacity, cpu));
         if (sd) {
                 /*
                  * When ASYM_CPUCAPACITY; see if there's a higher capacity CPU
                  * to run the misfit task on.
+                 * 当前 CPU 上存在一个“Misfit Task”（即 rq->misfit_task_load 非零，重任务跑在小核上
                  */
                 if (check_misfit_status(rq)) {
                         flags = NOHZ_STATS_KICK | NOHZ_BALANCE_KICK;
@@ -698,12 +602,13 @@ static void nohz_balancer_kick(struct rq *rq)
                  * For asymmetric systems, we do not want to nicely balance
                  * cache use, instead we want to embrace asymmetry and only
                  * ensure tasks have enough CPU capacity.
-                 *
+                 * 对于非对称系统，我们不追求对 cache 使用做均衡调度；相反，要顺应系统的非对称特性，仅保证任务能够获得充足的 CPU 算力
                  * Skip the LLC logic because it's not relevant in that case.
+                 * 此时跳过最后一级缓存（LLC）相关逻辑，因为该场景下缓存均衡逻辑不再适用
                  */
                 goto unlock;
         }
-
+        //条件 5：LLC 域（sd_llc_shared，见 sched_topo.md）负载不均
         sds = rcu_dereference_all(per_cpu(sd_llc_shared, cpu));
         if (sds) {
                 /*
@@ -714,23 +619,142 @@ static void nohz_balancer_kick(struct rq *rq)
                  * other CPUs are idle). We can't really know from here how busy
                  * the others are - so just get a NOHZ balance going if it looks
                  * like this LLC domain has tasks we could move.
+                 * 若各 LLC 域之间存在负载不均衡（也就是我们有机会提升整体 cache 利用率），
+                 * 就需要找到一个负载更低的 LLC 域，从当前域迁出部分负载。同理，也可能需要在当前
+                 * LLC 域内部打散负载（例如 SMT 核被任务占满，但同域其他 CPU 处于空闲）。
+                 * 在当前代码位置无法获知其他域的繁忙状态 —— 因此只要判断该 LLC 域存在可迁移任务，
+                 * 就触发一次 NOHZ 负载均衡。
                  */
                 nr_busy = atomic_read(&sds->nr_busy_cpus);
-                if (nr_busy > 1) {
+                if (nr_busy > 1) {//当前 CPU 所在的 LLC 域中，有超过 1 个繁忙的 CP（且有空闲 CPU 存在）
                         flags = NOHZ_STATS_KICK | NOHZ_BALANCE_KICK;
-                        goto unlock;
+                        goto unlock; //说明缓存资源可能没有被充分利用，或者 SMT 兄弟核之间负载不均，需要通过 ILB 来整理一下
                 }
         }
 unlock:
         rcu_read_unlock();
 out:
-        if (READ_ONCE(nohz.needs_update))
-                flags |= NOHZ_NEXT_KICK;
+        if (READ_ONCE(nohz.needs_update)) //如果系统需要更新 NOHZ 统计数据
+                flags |= NOHZ_NEXT_KICK;  //强制追加 NOHZ_NEXT_KICK 标志
 
         if (flags)
                 kick_ilb(flags);
 }
 ```
+
+#### `nohz.has_blocked_load`
+* `nohz.has_blocked_load` 表示 `nohz.idle_cpus_mask` 里的 tick-stopped idle CPU 可能还有 blocked PELT load/util 需要继续衰减更新
+  * 因为这些 CPU 停了 scheduler tick，不能靠本地 tick 周期性更新 blocked averages，所以需要别的 CPU 触发 `NOHZ_STATS_KICK`，代它们跑 `sched_balance_update_blocked_averages()`
+* 注意：`flags = NOHZ_STATS_KICK` 只置位了统计更新标志，并没有置位负载均衡标志，这是因为
+  * PELT 的负载平均值会随时间指数衰减。如果一个空闲 CPU 停了 tick（进入 NOHZ 模式），它上面的阻塞负载（blocked load）就无法被及时更新
+  * 如果长期不更新，调度器拿到的负载数据会是“过时且偏高”的。这会导致：
+    * `find_busiest_group()` 误判某些 CPU 依然很繁忙（其实是历史负载残留）
+    * 触发不必要的负载均衡
+  * 因此，调度器强制规定：哪怕没有任务需要迁移，到了时间（`next_blocked`）也必须强制唤醒 ILB CPU，去各个空闲 CPU 上把 PELT 数据“打扫”一遍（即更新 `rq->avg_rt`、`rq->avg_irq` 等）
+  * 此时 `flags` 只有 `NOHZ_STATS_KICK`，`kick_ilb()` 虽然发了 IPI，但 ILB 收到后只会更新统计，不会拉取任务
+
+### NOHZ 空闲负载均衡的跨核唤醒
+* `nohz_flags(cpu)` 是一个 per CPU 的原子位掩码（`atomic_t`），用于记录该 CPU 上待处理的 NOHZ 均衡请求类型（如普通均衡 `NOHZ_BALANCE_KICK`、统计更新 `NOHZ_STATS_KICK` 等）
+  * 它充当了一个无锁工作队列，用于在多个繁忙 CPU 同时想唤醒同一个空闲 CPU 时进行仲裁
+  * kernel/sched/sched.h
+```cpp
+#define nohz_flags(cpu)         (&cpu_rq(cpu)->nohz_flags)
+```
+* `rq->nohz_csd`：一个 `call_single_data` 结构体，通过 `INIT_CSD()` 初始化为绑定 `nohz_csd_func` 回调。它是 SMP 异步 IPI 的载体
+```cpp
+void __init sched_init(void)
+{
+...
+                 INIT_CSD(&rq->nohz_csd, nohz_csd_func, rq);
+...
+}
+```
+
+#### 发起端：`kick_ilb()` 踢醒空闲 CPU
+* 若已到执行时机，则通过跨 CPU 的 SMP 函数调用（IPI）唤醒一个 CPU 来执行 NOHZ 负载均衡
+* 我们选取 `HK_TYPE_KERNEL_NOISE` 管家集合中的第一个空闲 CPU（如果存在）
+  * kernel/sched/fair.c
+```cpp
+/*
+ * Kick a CPU to do the NOHZ balancing, if it is time for it, via a cross-CPU
+ * SMP function call (IPI).
+ *
+ * We pick the first idle CPU in the HK_TYPE_KERNEL_NOISE housekeeping set
+ * (if there is one).
+ */
+static void kick_ilb(unsigned int flags)
+{
+        int ilb_cpu;
+        //仅当触发完整 ILB 时才递增 nohz.next_balance，仅更新统计信息时不做该递增
+        /*
+         * Increase nohz.next_balance only when if full ilb is triggered but
+         * not if we only update stats.
+         */
+        if (flags & NOHZ_BALANCE_KICK)
+                nohz.next_balance = jiffies+1;
+        //选举 ILB（空闲负载均衡器）CPU
+        ilb_cpu = find_new_ilb();
+        if (ilb_cpu < 0)
+                return;
+        //若 ilb_cpu 不存在新的 NOHZ 均衡工作项，例如 flags 中的所有位在 ilb_cpu 上均已置位，则无需处理
+        /*
+         * Don't bother if no new NOHZ balance work items for ilb_cpu,
+         * i.e. all bits in flags are already set in ilb_cpu.
+         */     
+        if ((atomic_read(nohz_flags(ilb_cpu)) & flags) == flags)
+                return; 
+        //对 rq::nohz_csd 的访问由 NOHZ_KICK_MASK 做串行保护；第一个置位标志的调用方持有该对象；
+        //由 nohz_csd_func() 完成清除操作
+        /*
+         * Access to rq::nohz_csd is serialized by NOHZ_KICK_MASK; he who sets
+         * the first flag owns it; cleared by nohz_csd_func().
+         */
+        flags = atomic_fetch_or(flags, nohz_flags(ilb_cpu));
+        //如果返回的旧值中已经含有 KICK 标志，说明目标 CPU 上已有未处理的 IPI 在排队
+        //为了避免 IPI 风暴，直接放弃本次发送
+        if (flags & NOHZ_KICK_MASK)
+                return;
+        //通过该方式，我们向处于空闲状态的目标 CPU 发送 IPI，执行 NOHZ 空闲负载均衡的软中断会在 IPI 返回前完成运行
+        /*
+         * This way we generate an IPI on the target CPU which
+         * is idle, and the softirq performing NOHZ idle load balancing
+         * will be run before returning from the IPI.
+         */
+        smp_call_function_single_async(ilb_cpu, &cpu_rq(ilb_cpu)->nohz_csd);
+}
+```
+* 使用 `atomic_fetch_or()` 做“分布式锁”：
+  * 多个繁忙 CPU 可能同时选中同一个空闲 CPU
+  * 通过原子操作，**第一个成功设置 `NOHZ_KICK_MASK` 的 CPU** 获得发送 IPI 的权利，其他 CPU 看到旧值中已有 `NOHZ_KICK_MASK` 后直接返回
+  * 这避免了多个 IPI 涌向同一个空闲 CPU
+* 异步发送（`_async` 后缀）CSD：繁忙 CPU 不需要等待空闲 CPU 处理完均衡再返回，避免了繁忙 CPU 因 IPI 响应而陷入阻塞延迟
+
+#### 接收端：`nohz_csd_func()` 空闲 CPU 被唤醒后做什么
+```cpp
+static void nohz_csd_func(void *info)
+{
+        struct rq *rq = info; 
+        int cpu = cpu_of(rq);
+        unsigned int flags;
+        //清除本 CPU 的 nohz_flags 中的 KICK 位（表示“正在处理”）
+        /*
+         * Release the rq::nohz_csd.
+         */
+        flags = atomic_fetch_andnot(NOHZ_KICK_MASK | NOHZ_NEWILB_KICK, nohz_flags(cpu));
+        WARN_ON(!(flags & NOHZ_KICK_MASK));
+        //再次检查当前 CPU 是否真的还处于空闲状态
+        rq->idle_balance = idle_cpu(cpu);
+        if (rq->idle_balance) {
+                rq->nohz_idle_balance = flags; //如果确实仍空闲，将 flags 暂存到 rq 中
+                __raise_softirq_irqoff(SCHED_SOFTIRQ); //然后触发调度软中断
+        }
+}
+```
+* 为什么必须二次检查 `idle_cpu`？
+  * 从繁忙 CPU 调用 `find_new_ilb()` 选出 `ilb_cpu`，到它发送 IPI，再到 IPI 真正抵达目标 CPU，这之间存在时间窗口
+  * 在这个窗口内，目标 CPU 可能已经被其他任务唤醒（`ttwu_pending` 或 `nr_running` 增加）
+  * 如果目标 CPU 不再空闲，则绝不能在当前上下文中触发 `SCHED_SOFTIRQ`，否则会在一个正在繁忙执行任务的 CPU 上强行插入负载均衡软中断，既浪费算力，也破坏调度公平
+* 内存屏障隐含：`atomic_fetch_andnot` 和 `atomic_fetch_or` 本身包含完整的内存屏障（full barrier），确保了 `nohz_flags` 的修改与 `rq` 其他状态的可见性顺序，是多核并发下的安全保障
 
 ## `SCHED_SOFTIRQ` 软中断处理函数 `sched_balance_softirq()`
 * `SCHED_SOFTIRQ` 软中断在两个地方触发：

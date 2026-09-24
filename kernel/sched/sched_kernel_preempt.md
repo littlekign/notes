@@ -3,28 +3,28 @@
 ## 目录
 
 - [内核抢占](#内核抢占)
-  - [目录](#目录)
-  - [用户抢占发生的时机](#用户抢占发生的时机)
-  - [非内核抢占](#非内核抢占)
-  - [内核抢占发生的时机](#内核抢占发生的时机)
-  - [是否能被抢占？](#是否能被抢占)
-  - [抢占计数 preempt\_count](#抢占计数-preempt_count)
-    - [增减抢占计数](#增减抢占计数)
-    - [x86 的 preempt\_count](#x86-的-preempt_count)
-      - [`PREEMPT_NEED_RESCHED` 标志位](#preempt_need_resched-标志位)
-    - [ARM 的 preempt\_count](#arm-的-preempt_count)
-  - [中断返回时的内核抢占](#中断返回时的内核抢占)
-    - [x86-64的实现](#x86-64的实现)
-    - [PowerPC-32的实现](#powerpc-32的实现)
-    - [preempt\_schedule\_irq()函数](#preempt_schedule_irq函数)
-  - [延迟抢占模式（PREEMPT\_LAZY）](#延迟抢占模式preempt_lazy)
-    - [设置 `TIF_NEED_RESCHED_LAZY` 标志](#设置-tif_need_resched_lazy-标志)
-    - [`PREEMPT_LAZY` 所谓的 lazy 体现在哪些方面？](#preempt_lazy-所谓的-lazy-体现在哪些方面)
-    - [处于 lazy 状态的进程什么时候会获得调度的机会？](#处于-lazy-状态的进程什么时候会获得调度的机会)
-  - [动态调节抢占模式](#动态调节抢占模式)
-    - [如果不开启动态调节抢占模式，`PREEMPT_NONE` 如何禁止 *抢占启用* 和 *中断返回内核态时的调度点*？](#如果不开启动态调节抢占模式preempt_none-如何禁止-抢占启用-和-中断返回内核态时的调度点)
-    - [`__cond_resched` 的生效与否](#__cond_resched-的生效与否)
-  - [References](#references)
+        - [目录](#目录)
+        - [用户抢占发生的时机](#用户抢占发生的时机)
+        - [非内核抢占](#非内核抢占)
+        - [内核抢占发生的时机](#内核抢占发生的时机)
+        - [是否能被抢占？](#是否能被抢占)
+        - [抢占计数 preempt\_count](#抢占计数-preempt_count)
+                - [增减抢占计数](#增减抢占计数)
+                - [x86 的 preempt\_count](#x86-的-preempt_count)
+                        - [`PREEMPT_NEED_RESCHED` 标志位](#preempt_need_resched-标志位)
+                - [ARM 的 preempt\_count](#arm-的-preempt_count)
+        - [中断返回时的内核抢占](#中断返回时的内核抢占)
+                - [x86-64的实现](#x86-64的实现)
+                - [PowerPC-32的实现](#powerpc-32的实现)
+                - [preempt\_schedule\_irq()函数](#preempt_schedule_irq函数)
+        - [延迟抢占模式（PREEMPT\_LAZY）](#延迟抢占模式preempt_lazy)
+                - [设置 `TIF_NEED_RESCHED_LAZY` 标志](#设置-tif_need_resched_lazy-标志)
+                - [`PREEMPT_LAZY` 所谓的 lazy 体现在哪些方面？](#preempt_lazy-所谓的-lazy-体现在哪些方面)
+                - [处于 lazy 状态的进程什么时候会获得调度的机会？](#处于-lazy-状态的进程什么时候会获得调度的机会)
+        - [动态调节抢占模式](#动态调节抢占模式)
+                - [如果不开启动态调节抢占模式，`PREEMPT_NONE` 如何禁止 *抢占启用* 和 *中断返回内核态时的调度点*？](#如果不开启动态调节抢占模式preempt_none-如何禁止-抢占启用-和-中断返回内核态时的调度点)
+                - [`__cond_resched` 的生效与否](#__cond_resched-的生效与否)
+        - [References](#references)
 
 ## 用户抢占发生的时机
 * 从系统调用返回用户空间时（在执行系统调用期间被抢占属于内核抢占，这里说的是执行用户态的代码时发生的抢占，比如说用户态的程序 A 切换到了用户态程序 B）
@@ -681,8 +681,8 @@ static __always_inline unsigned long __exit_to_user_mode_loop(struct pt_regs *re
 
 ## 动态调节抢占模式
 * 开启 `CONFIG_PREEMPT_DYNAMIC` 可以动态调节抢占模式的能力
-  * 通过 kernel command line `preempt= none | voluntary |full | lazy` 在启动时选择
-  * 通过往 debugfs `/sys/kernel/debug/sched/preempt` 接口写入 `none | voluntary |full | lazy` 来设置
+  * 通过 kernel command line `preempt= none | voluntary | full | lazy` 在启动时选择
+  * 通过往 debugfs `/sys/kernel/debug/sched/preempt` 接口写入 `none | voluntary | full | lazy` 来设置
 * 这里的核心函数是 `__sched_dynamic_update()`，它通过动态调节一系列和抢占相关的 static key 和 static call 来控制抢占点的生效与否
   * kernel/sched/core.c
 ```cpp
