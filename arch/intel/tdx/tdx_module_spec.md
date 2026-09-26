@@ -465,6 +465,73 @@ tdx_static_assert(sizeof(pamt_entry_t) == PAMT_ENTRY_SIZE_IN_BYTES, pamt_entry_t
 * **在物理层面，`PAMT_1G` 和 `PAMT_2M` 层级为每个 TDMR 静态分配，与静态 PAMT 的做法相同；只有 `PAMT_4K` 层级是动态分配的**
 * 大小为 `4KB` 的 PAMT 页无法被 Dynamic PAMT 树映射，而它们是构建动态树部分所必需的
   * 因此，使用一个 per-TDMR 静态分配的位图（bitmap）来控制 PAMT 页的分配
+![Dynamic PAMT Tree Example](pic/dyn_pamt_tree.png)
+
+* **PAMT 条目第 2 级**
+  * 每个 PAMT 条目映射 `1GB`（`HPA[29:0] == 0`）
+  * 由 host VMM 作为 `PAMT_1G` 数组的一部分**静态分配**
+* **PAMT 条目第 1 级**
+  * 每个 PAMT 条目映射 `2MB`（`HPA[20:0] == 0`）
+  * 由 host VMM 作为 `PAMT_2M` 数组的一部分**静态分配**
+* **PAMT 条目第 0 级**
+  * 每个 **PAMT 页对** 映射 `2MB`（`HPA[20:0] == 0`）
+  * 每个 **PAMT 条目** 映射 `4KB`（`HPA[11:0] == 0`）
+  * 译注：一个 PAMT 页有 `256` 个 PAMT 条目，于是一个 PAMT 页对有 `512` 个 PAMT 条目
+* **静态 PAMT**：由 host VMM 作为 `PAMT_4K` 数组的一部分静态分配
+* **动态 PAMT**：由 host VMM 动态添加和移除
+* 下表列出了 PAMT 树的各级层级。
+  * 要将 TDX module 配置为 Dynamic PAMT 模式，其有效物理地址宽度（不含 HKID bits）必须为 `48` bits 或更低
+  * 对于物理地址宽度为 `52` bits 的平台，这意味着至少需要将 4 个 bits 配置为 HKID bits。因此，需要 4 个 PAMT 层级
+  * 译注：这里的推理是，`48` bits 有效地址减去 `4KB` 页偏移的 `12` bits 后，剩余 `36` bits 页帧号；每个 PAMT 层级通过页对中的 `512（2⁹）` 个条目覆盖 `9` bits 地址，`36 ÷ 9 = 4`，故恰好需要 4 个 PAMT 层级
+* Table 8.4: Dynamic PAMT Levels
+
+PAMT 条目层级 | PAMT 条目映射 | PAMT 页对映射 | 由 HPA bits 索引的 PAMT 条目
+-------------|-------------|--------------|---------------------------
+0            | 4KB         | 2MB          | `20:12`
+1            | 2MB         | 1GB          | `29:21`
+2            | 1GB         | 512GB        | `38:30`
+
+##### 8.3.4.2 PAMT Page Pair
+
+* PAMT 页始终以 **一对 4KB 物理页** 的形式进行管理，这对物理页在物理地址空间中 **不要求连续**
+* 一个 **PAMT 页对** 总共容纳 `512` 个 **16 字节** 的 PAMT 条目
+  * 每个 PAMT 条目可以是与某个物理页关联的 **叶子条目**，也可以是指向更低层级 PAMT 页对的 **非叶子条目**
+* PAMT 页在内存中使用 TDX module 的全局私有 HKID 进行加密
+* *PAMT 页对* 内的 PAMT 条目使用 HPA 的 9 个位进行索引，如上表所示
+  * 前 256 个条目位于页对中的第一个 PAMT 页，后 256 个条目位于页对中的第二个 PAMT 页
+* 与静态 PAMT 相同，`PAMT_1G` 和 `PAMT_2M` 层级的 PAMT 页对为每个 TDMR 静态分配，作为该 TDMR 的 `PAMT_1G` 和 `PAMT_2M` 数组的一部分
+* `PAMT_4K` 层级的 PAMT 页对由 host VMM 按需 **动态分配**，用于映射分配给 TDX 的物理页，通过 `TDH.PHYMEM.PAMT.ADD` 完成
+* 当将 `2MB` 页面 **降级（demote）** 为 512 个 `4KB` 页面时，`TDH.MEM.PAGE.DEMOTE` 接口函数也要求 host VMM 在其输入参数中分配一个 *PAMT 页对*
+* `PAMT_4K` 层级的 PAMT 页对（由非 root `PAMT_2M` 条目指向）在不再需要时，可由 host VMM 通过 `TDH.PHYMEM.PAMT.REMOVE` **动态移除**
+* 当将 512 个 `4KB` 页面 **提升（promote）** 为 `2MB` 页面时，`TDH.MEM.PAGE.PROMOTE` 接口函数也会在其操作过程中移除一个 PAMT 页对
+
+##### 8.3.4.2 PAMT Page Bitmap
+
+* 每个 PAMT 页由一个 **非叶子 PAMT** 条目 **指向**，其 **PT = PT_PAMT**
+* 然而，由于 PAMT 页只是可能位于 TDMR 内任意 HPA 处的 `4KB` 页，它同样需要 **被映射**，以便控制其分配与移除
+* 但与其它页类型相反，`4KB` PAMT 页无法由普通的 `PAMT_4K` 条目映射，因为这类条目同样位于动态分配的 `4KB` PAMT 页中，而这些页甚至可能尚未存在
+* 因此，==PAMT 页由每个 TDMR 静态分配的 **PAMT_PAGE_BITMAP（PAMT 页位图）** 映射==
+  * 位图中的第 `N` 位对应于 TDMR 中的第 `N` 个 `4KB` 页
+  * 位值为 `0` 表示该页 **不是 PAMT 页**
+  * 位值为 `1` 表示该页要么是 PAMT 页，要么被保留
+* PAMT_PAGE_BITMAP 位值与可能的 PAMT 条目的组合如下方表 8.6 所示
+
+##### 8.3.4.3 Non-Leaf PAMT Entry
+* **注意**： 以下描述为高层概述，具体实现细节可能有所不同
+* 非叶子 PAMT 条目保存着一对更低层级 PAMT 页的元数据
+* Table 8.5: High-Level View of a Non-Leaf PAMT Entry
+
+域        | 描述
+----------|-------
+PT        | PT（Page Type）表示打算与此 PAMT 条目相关联的页的类型。对于非叶子条目，PT 为 `PT_PAMT`
+PAGE_HPA0 | 本条目指向的第一个 PAMT 页的 HPA
+PAGE_HPA1 | 本条目指向的第二个 PAMT 页的 HPA
+
+##### 8.3.4.4 Dynamic PAMT Hierarchy
+* 下表显示了在三个层级上 PAMT 条目的页类型（PT）以及 `PAMT_PAGE_BITMAP` 的位值，具体取决于以下因素：
+  * Intel TDX module 是否管理该页
+  * 该页是否在安全 EPT 中映射
+  * 映射的大小
 
 ![Dynamic PAMT Hierarchy and Page Types](pic/dyn_pamt_and_pt.png)
 
