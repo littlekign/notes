@@ -1,7 +1,7 @@
 # CPU 负载均衡
 
 * 负载均衡主要是 CFS 的 pull 模型：目标 CPU 在 tick、即将 idle、NOHZ idle 或 `wake/fork/exec` 选核时，判断自己是否应该参与均衡，然后找最忙的 `sched_group`、最忙的 `rq`，再从源 `runqueue` 拉任务过来
-
+* NOHZ 更新时间
 ```c
 apic_timer_interrupt()
 -> smp_apic_timer_interrupt()
@@ -13,6 +13,24 @@ apic_timer_interrupt()
                -> tick_sched_handle()
                      //kernel/time/timer.c
                   -> update_process_times(user_mode(regs))
+```
+* 周期性更新时间
+```c
+//kernel/time/tick-common.c
+tick_setup_device()
+   if (tick_device_uses_broadcast(newdev, cpu))
+      -> dev->event_handler = tick_handle_periodic;
+      return;
+   if (td->mode == TICKDEV_MODE_PERIODIC)
+      tick_setup_periodic(newdev, 0);
+         //kernel/time/tick-broadcast.c
+      -> tick_set_periodic_handler(dev, broadcast)
+            if (!broadcast)
+               dev->event_handler = tick_handle_periodic;
+            else
+               dev->event_handler = tick_handle_periodic_broadcast;
+   else
+      tick_setup_oneshot(newdev, handler, next_event);
 
 //kernel/time/tick-common.c
 tick_handle_periodic()
@@ -20,7 +38,7 @@ tick_handle_periodic()
       //kernel/time/timer.c
    -> update_process_times(user_mode(get_irq_regs()))
 ```
-
+* NOHZ 和周期性 tick 触发负载均衡的路径
 ```c
 //kernel/time/timer.c
 update_process_times()
@@ -36,6 +54,7 @@ update_process_times()
       -> nohz_balancer_kick(rq)
 ```
 
+## NOHZ 空闲负载均衡
 ### `nohz_balance_exit_idle()`：CPU 退出空闲状态
 * `nohz_balance_exit_idle(struct rq *rq)` 是 CPU 从空闲状态退出的“出口”函数，它会执行一系列清理工作
 ```cpp
@@ -756,9 +775,9 @@ static void nohz_csd_func(void *info)
   * 如果目标 CPU 不再空闲，则绝不能在当前上下文中触发 `SCHED_SOFTIRQ`，否则会在一个正在繁忙执行任务的 CPU 上强行插入负载均衡软中断，既浪费算力，也破坏调度公平
 * 内存屏障隐含：`atomic_fetch_andnot` 和 `atomic_fetch_or` 本身包含完整的内存屏障（full barrier），确保了 `nohz_flags` 的修改与 `rq` 其他状态的可见性顺序，是多核并发下的安全保障
 
-## `SCHED_SOFTIRQ` 软中断处理函数 `sched_balance_softirq()`
+### `SCHED_SOFTIRQ` 软中断处理函数 `sched_balance_softirq()`
 * `SCHED_SOFTIRQ` 软中断在两个地方触发：
-1. 为做周期性的负载均衡由直接由本地的 `sched_tick()` 触发
+1. 为做周期性的负载均衡由直接由本地的 `sched_tick() -> sched_balance_trigger()` 触发
 2. 为做 NOHZ idle 均衡通过 SMP cross-call `nohz_csd_func()` 间接由远程的 `sched_tick()` 触发
 * 如果该 CPU 有一个挂起的 `NOHZ_BALANCE_KICK`，那么代替其他 idle CPU 做负载均衡，因为它们的 tick 已经停止了
   * 在 `sched_balance_domains()` 之前做 `nohz_idle_balance()`，给 idle CPU 一个做负载均衡的机会
@@ -790,6 +809,255 @@ static __latent_entropy void sched_balance_softirq(void)
         /* normal load balance */
         sched_balance_update_blocked_averages(this_rq->cpu);
         sched_balance_domains(this_rq, idle);
+}
+```
+
+### 进行 NOHZ 空闲负载均衡
+* NOHZ 空闲负载均衡入口函数 `nohz_idle_balance()`，被踢醒了后起来负责干活
+```cpp
+/*
+ * In CONFIG_NO_HZ_COMMON case, the idle balance kickee will do the
+ * rebalancing for all the CPUs for whom scheduler ticks are stopped.
+ */
+static bool nohz_idle_balance(struct rq *this_rq, enum cpu_idle_type idle) 
+{
+        unsigned int flags = this_rq->nohz_idle_balance;
+        //flags 是由 nohz_csd_func() 在 IPI 中断中存入 rq->nohz_idle_balance 的
+        if (!flags)
+                return false;           //没有待处理的 NOHZ 请求
+
+        this_rq->nohz_idle_balance = 0; //清除标志，防止重复执行
+        //只有 idle == CPU_IDLE（严格空闲状态）才允许执行。如果 CPU 已经被唤醒去跑别的任务，就不适合再替别人做均衡了
+        if (idle != CPU_IDLE)           //只有真正处于 CPU_IDLE 状态才干活
+                return false;
+
+        _nohz_idle_balance(this_rq, flags);
+        //告诉上层 sched_balance_softirq()：“我已经执行过 NOHZ 均衡了，你不要再走常规负载均衡路径”
+        return true; 
+}
+```
+* `_nohz_idle_balance()` 是内部函数，用于对所有空闲 CPU 执行负载均衡。根据标志位的不同，本次负载均衡可以仅做阻塞负载的简易更新，或是执行包含任务迁移的完整负载均衡。
+```cpp
+/*
+ * Internal function that runs load balance for all idle CPUs. The load balance
+ * can be a simple update of blocked load or a complete load balance with
+ * tasks movement depending of flags.
+ */
+static void _nohz_idle_balance(struct rq *this_rq, unsigned int flags)
+{
+	/* Earliest time when we have to do rebalance again */
+	unsigned long now = jiffies;
+	unsigned long next_balance = now + 60*HZ;
+	bool has_blocked_load = false;
+	int update_next_balance = 0;
+	int this_cpu = this_rq->cpu;
+	int balance_cpu;
+	struct rq *rq;
+	//NOHZ_BALANCE_KICK 通常总是和 NOHZ_STATS_KICK 一起被设置，如果 NOHZ_BALANCE_KICK 单独出现，说明状态机出了问题
+	WARN_ON_ONCE((flags & NOHZ_KICK_MASK) == NOHZ_BALANCE_KICK);
+	//我们假定本次更新完成后不再存在空闲负载，并清除 has_blocked_load 标志。
+	//如果在此期间有 CPU 进入空闲状态，该 CPU 会置位 has_blocked_load 标志，触发新一轮空闲负载更新。
+	//由于 CPU 变为空闲时，会先加入 idle_cpus_mask 掩码，再置位该标志，因此我们可以保证不会误清状态，
+	//也不会遗漏对空闲 CPU 的负载检查。
+	//idle_cpus_mask 与 needs_update 之间的逻辑同样遵循该规则。
+	/*
+	 * We assume there will be no idle load after this update and clear
+	 * the has_blocked_load flag. If a cpu enters idle in the mean time, it will
+	 * set the has_blocked_load flag and trigger another update of idle load.
+	 * Because a cpu that becomes idle, is added to idle_cpus_mask before
+	 * setting the flag, we are sure to not clear the state and not
+	 * check the load of an idle cpu.
+	 *
+	 * Same applies to idle_cpus_mask vs needs_update.
+	 */
+	if (flags & NOHZ_STATS_KICK)
+		WRITE_ONCE(nohz.has_blocked_load, 0);
+	if (flags & NOHZ_NEXT_KICK)
+		WRITE_ONCE(nohz.needs_update, 0);
+	//内存屏障确保上面的清零操作对其他 CPU 可见
+	/*
+	 * Ensures that if we miss the CPU, we must see the has_blocked_load
+	 * store from nohz_balance_enter_idle().
+	 * 如果我们漏掉了某个刚进入空闲的 CPU，我们一定能看到它在 nohz_balance_enter_idle() 中对 has_blocked_load 的写入
+	 */
+	smp_mb();
+	//从 this_cpu 的下一个 CPU 开始遍历，让我们以 this_cpu 结尾，给其他空闲 CPU 一个拉取负载的机会
+	/*
+	 * Start with the next CPU after this_cpu so we will end with this_cpu and let a
+	 * chance for other idle cpu to pull load.
+	 */
+	for_each_cpu_wrap(balance_cpu,  nohz.idle_cpus_mask, this_cpu+1) {
+		if (!idle_cpu(balance_cpu)) //虽然 balance_cpu 在 nohz.idle_cpus_mask 中，但可能刚好被唤醒
+			continue;           //跳过它，避免干扰正在恢复繁忙的 CPU
+		//场景：正在替别人干活的这个 CPU（this_cpu），自己突然被唤醒了（!idle_cpu(this_cpu)），
+		//并且有更高优先级的任务需要调度（need_resched()）
+		//动作：立即中止均衡工作。但在中止前，必须保存状态
+		/*
+		 * If this CPU gets work to do, stop the load balancing
+		 * work being done for other CPUs. Next load
+		 * balancing owner will pick it up.
+		 * 如果该 CPU 忽然来活了，停止为其他 CPU 所作的负载均衡工作。下一个负载均衡的 owner 会继续。
+		 */
+		if (!idle_cpu(this_cpu) && need_resched()) {
+			if (flags & NOHZ_STATS_KICK)//如果还有统计更新任务没做完，把 has_blocked_load 重新置位
+				has_blocked_load = true; //告诉系统“还有活没干完，下次再来”
+			if (flags & NOHZ_NEXT_KICK)
+				WRITE_ONCE(nohz.needs_update, 1);
+			goto abort; //宁可让空闲 CPU 的均衡工作延迟，也不能耽误当前 CPU 自己的调度任务
+		}
+
+		rq = cpu_rq(balance_cpu);
+		//刷新目标 CPU 的 PELT 阻塞负载统计（即 rq->avg_rt、rq->avg_irq、cfs_rq->avg 等）
+		//has_blocked_load |= 累计标记。只要任何一个 CPU 有阻塞负载，最终就会重新设置全局的 nohz.has_blocked_load，确保下一轮还会来更新
+		if (flags & NOHZ_STATS_KICK)
+			has_blocked_load |= update_nohz_stats(rq);
+		//只有当目标 CPU 的 next_balance 到期时，才进行任务迁移
+		/*
+		 * If time for next balance is due,
+		 * do the balance.
+		 */
+		if (time_after_eq(jiffies, rq->next_balance)) {
+			struct rq_flags rf;
+
+			rq_lock_irqsave(rq, &rf);
+			update_rq_clock(rq); //更新该 CPU 的时钟（因为它的 tick 停了，rq->clock 可能过时）
+			rq_unlock_irqrestore(rq, &rf);
+			//只有 NOHZ_BALANCE_KICK 标志存在时才做迁移。如果只有 NOHZ_STATS_KICK，则跳过
+			if (flags & NOHZ_BALANCE_KICK)
+				sched_balance_domains(rq, CPU_IDLE);
+		}
+		//目的：在所有被遍历的 CPU 中，找出最早需要下一次均衡的时间点
+		//next_balance 初始化为 now + 60*HZ（60 秒后）。如果某个 CPU 的 next_balance 更早，就更新这个值
+		if (time_after(next_balance, rq->next_balance)) {
+			next_balance = rq->next_balance; //将这个最早的时间写入 nohz.next_balance，作为全局的下一次 NOHZ 均衡触发时间
+			update_next_balance = 1;
+		}
+	}
+	//只有确实找到了更早的 next_balance 时间才更新
+	/*
+	 * next_balance will be updated only when there is a need.
+	 * When the CPU is attached to null domain for ex, it will not be
+	 * updated.
+	 */
+	if (likely(update_next_balance))
+		nohz.next_balance = next_balance;
+	//设置下一次统计更新时间。这保证了即使系统完全空闲，PELT 统计也会定期被刷新
+	if (flags & NOHZ_STATS_KICK)
+		WRITE_ONCE(nohz.next_blocked,
+			   now + msecs_to_jiffies(LOAD_AVG_PERIOD));
+	//如果还有 CPU 的阻塞负载没更新完（或被中止），重新置位全局标志，确保下一轮 nohz_balancer_kick 会再次触发统计更新
+abort:
+	/* There is still blocked load, enable periodic update */
+	if (has_blocked_load)
+		WRITE_ONCE(nohz.has_blocked_load, 1);
+}
+```
+* `update_nohz_stats()` 是 NOHZ 空闲负载均衡中负责按需更新指定 CPU 阻塞负载统计的辅助函数
+  * 被 `_nohz_idle_balance()` 在遍历所有空闲 CPU 时调用，用于决定“这个 CPU 的 PELT 阻塞负载现在要不要刷新？刷新后还有没有残留？”
+  * 只在“有负载、仍空闲、且到期”时才真正刷新 PELT 统计，并通过返回值精确告知调用者“这个 CPU 是否还需要后续的统计更新”
+```cpp
+static bool update_nohz_stats(struct rq *rq)
+{       //简单取出目标 CPU 编号，后续用于掩码检查和实际更新
+        unsigned int cpu = rq->cpu;
+        //在 nohz_balance_enter_idle() 中被置为 1，表示该 CPU 上有未清理的 PELT 阻塞负载
+        if (!rq->has_blocked_load) //为 0，说明没有需要更新的东西
+                return false;      //直接返回 false，避免无谓开销
+        //虽然 _nohz_idle_balance() 是从 nohz.idle_cpus_mask 中遍历出来的，但在遍历过程中，
+        //目标 CPU 可能刚好被唤醒并退出了空闲（nohz_balance_exit_idle() 会清除掩码）
+        if (!cpumask_test_cpu(cpu, nohz.idle_cpus_mask))
+                return false; //如果它已经不再空闲，就不应该再替它更新统计
+        //rq->last_blocked_load_update_tick 记录该 CPU 上次更新阻塞负载的 jiffies 时间
+        //能走到这里 rq->has_blocked_load 仍然为 1，且 CPU 仍在空闲掩码中，说明确实存在阻塞负载，只是还不到刷新时间
+        if (!time_after(jiffies, READ_ONCE(rq->last_blocked_load_update_tick)))
+                return true;//告诉调用者：“这个 CPU 还有阻塞负载，需要以后继续关注”，从而让全局的 nohz.has_blocked_load 保持置位，安排下一轮更新
+        //时间到期后，调用这个函数真正刷新该 CPU 的 PELT 阻塞负载
+        sched_balance_update_blocked_averages(cpu); //可能将 rq->has_blocked_load 清 0（如果更新后没有残留）
+        //更新完成后，再次读取 rq->has_blocked_load
+        //如果更新后已经没有阻塞负载了，返回 false；如果仍有（例如更新期间又有新的阻塞负载加入），返回 true
+        //这样调用者就能准确知道该 CPU 是否还需要后续关注
+        return rq->has_blocked_load;
+}
+```
+
+### CPU 进入 NOHZ 空闲状态时设置的负载均衡相关信息
+```cpp
+static void set_cpu_sd_state_idle(int cpu)
+{
+        struct sched_domain *sd;
+        sd = rcu_dereference_all(per_cpu(sd_llc, cpu)); //返回该 CPU 所属的最后一级缓存（LLC）调度域
+
+        /* See set_cpu_sd_state_busy(): nohz_idle is only used with sd->shared. */
+        if (!sd || !sd->shared || sd->nohz_idle)
+                return;
+        sd->nohz_idle = 1; //表示该 LLC 域进入“至少有一个 CPU 空闲”的状态
+        //这个计数器是 nohz_balancer_kick() 中判断“LLC 域内是否有多个繁忙 CPU”的依据
+        atomic_dec(&sd->shared->nr_busy_cpus);
+}
+//该例程将会记录 CPU 将要以停止 tick 的方式进入 idle。该信息会在将来被用于执行空闲负载均衡
+/*
+ * This routine will record that the CPU is going idle with tick stopped.
+ * This info will be used in performing idle load balancing in the future.
+ */
+void nohz_balance_enter_idle(int cpu)
+{
+        struct rq *rq = cpu_rq(cpu);
+        //这个函数只能在 CPU 自己的上下文（即将进入空闲）中调用
+        WARN_ON_ONCE(cpu != smp_processor_id());
+        //如果 CPU 正在下线（热拔出），直接返回，不做任何状态记录
+        /* If this CPU is going down, then nothing needs to be done: */
+        if (!cpu_active(cpu))
+                return;
+        //因为这个 CPU 即将停掉 tick，它的 PELT 阻塞负载（blocked load）将无法被及时更新。
+        //标记这个标志，是为了告诉系统“这个 CPU 上有未清理的负载”
+        /*
+         * Can be set safely without rq->lock held
+         * If a clear happens, it will have evaluated last additions because
+         * rq->lock is held during the check and the clear
+         * 这里不需要持有 rq->lock，因为如果后续有清除操作，它一定会在持有 rq->lock 的情况下检查并清除，此时会看到这个写入
+         */
+        rq->has_blocked_load = 1;
+        //因为 nohz.idle_cpus_mask 和 sd->nohz_idle 等状态已经设置过了（这个函数之前走进来过？），
+        //不需要重复设置。但负载可能在 tick 停止期间被添加，所以需要重新触发一次检查
+        /*
+         * The tick is still stopped but load could have been added in the
+         * meantime. We set the nohz.has_blocked_load flag to trig a check of the
+         * *_avg. The CPU is already part of nohz.idle_cpus_mask so the clear
+         * of nohz.has_blocked_load can only happen after checking the new load
+         * 
+         * Tick 仍然处于停止状态，但在此期间可能新增负载。我们置位 nohz.has_blocked_load 标志，
+         * 触发对各类 *_avg 负载统计值的检查。该 CPU 已经在 nohz.idle_cpus_mask 掩码中，因此
+         * nohz.has_blocked_load 标志只能在完成新负载检查之后才会被清除
+         */
+        if (rq->nohz_tick_stopped)
+                goto out;
+         //如果这个 CPU 没有关联任何调度域（完全隔离的 CPU，如 isolcpus 或 nohz_full 隔离的 CPU），则直接返回
+        /* If we're a completely isolated CPU, we don't play: */
+        if (on_null_domain(rq)) //这些 CPU 不参与负载均衡，不需要被记录到 NOHZ 空闲 CPU 集合中
+                return;
+        //标记该 CPU 的 tick 已停止
+        rq->nohz_tick_stopped = 1;
+        //将该 CPU 加入全局 NOHZ 空闲 CPU 掩码。从此以后，find_new_ilb() 和 _nohz_idle_balance() 都会遍历到这个 CPU
+        cpumask_set_cpu(cpu, nohz.idle_cpus_mask);
+        //作用：确保 idle_cpus_mask 的设置（原子操作）先于后续的 has_blocked_load 和 needs_update 写入对其他 CPU 可见
+        //如果 _nohz_idle_balance() 没有观察到 idle_cpus_mask 的写入（即没遍历到这个 CPU），
+        //那么它一定能观察到后续的 has_blocked_load 和 needs_update 写入。这样保证了这个 CPU
+        //不会“两头落空”——要么被遍历到，要么被标志位唤醒
+        /*
+         * Ensures that if nohz_idle_balance() fails to observe our
+         * @idle_cpus_mask store, it must observe the @has_blocked_load
+         * and @needs_update stores.
+         */
+        smp_mb__after_atomic();
+        //将 LLC 调度域标记为空闲，递减 nr_busy_cpus
+        set_cpu_sd_state_idle(cpu);
+        //告诉系统“有空闲 CPU 状态变化了，需要更新”
+        WRITE_ONCE(nohz.needs_update, 1);
+out:    //无论走哪条路径，最终都会执行下面这条语句。这是因为每个进入空闲的 CPU 都可能带来新的阻塞负载，必须触发一次 PELT 统计更新
+        /*
+         * Each time a cpu enter idle, we assume that it has blocked load and
+         * enable the periodic update of the load of idle CPUs
+         */
+        WRITE_ONCE(nohz.has_blocked_load, 1);
 }
 ```
 
