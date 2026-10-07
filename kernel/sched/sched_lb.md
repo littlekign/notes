@@ -979,6 +979,336 @@ static bool update_nohz_stats(struct rq *rq)
 }
 ```
 
+### PELT 阻塞负载（blocked load）更新
+
+#### PELT 阻塞负载（blocked load）更新的入口
+* `decayed`：本次更新中，是否有负载发生了时间衰减（即值变小了）
+* `done`：是否 **所有** 阻塞负载都已处理干净（没有残留）
+  * 初始为 `true`，只要有任何残留会被子函数置为 `false`
+* `__update_blocked_others()` 这里的 `other`（非 CFS）指的是：RT（实时）、DL（截止时间）、IRQ（中断）、Thermal（热压力） 这些非 CFS 类的 PELT 负载
+  * 传入 `&done`：如果 RT/DL/IRQ 中有阻塞负载没清干净，会把 `done` 置为 `false`
+  * 返回值赋给 `decayed`：如果任何一项负载发生了衰减（比如 RT 任务迁移走了，`rq->avg_rt` 应该随之下降），就返回 `true`
+* `cpufreq_update_util()` 通知 CPUFreq：
+  * CPUFreq 的 **schedutil 调速器** 使用 PELT 的 `util_avg` 来决定 CPU 频率
+  * 如果阻塞负载发生了衰减（即 CPU 实际需求变小了），但调速器还基于旧的 `util_avg` 维持高频，就会浪费功耗
+  * 所以一旦检测到衰减，立即通知 schedutil 重新评估，及时降频
+```c
+static void __sched_balance_update_blocked_averages(struct rq *rq)
+{   
+    bool decayed = false, done = true;
+    //先记录“本次更新发生了”，供后续节流判断使用
+    update_blocked_load_tick(rq);
+    //更新 RT/DL/IRQ/Thermal 的 PELT 阻塞负载
+    decayed |= __update_blocked_others(rq, &done);
+    decayed |= __update_blocked_fair(rq, &done); //更新 CFS 的 PELT 阻塞负载
+    //如果本次更新确认“没有残留的阻塞负载”，就把 rq->has_blocked_load 清零
+    update_has_blocked_load_status(rq, !done); //如果还有残留，保持 1 让 update_nohz_stats() 下一轮继续来处理
+    if (decayed) //只有确实发生衰减才通知，避免无意义的调用
+        cpufreq_update_util(rq, 0); //通知 schedutil 降频
+}
+
+static void sched_balance_update_blocked_averages(int cpu)
+{   
+    struct rq *rq = cpu_rq(cpu);
+    
+    guard(rq_lock_irqsave)(rq);
+    update_rq_clock(rq); //更新队列的时间，见 sched_pelt.md
+    __sched_balance_update_blocked_averages(rq);
+}
+```
+
+##### 记录更新阻塞负载的时间
+* `rq->last_blocked_load_update_tick` 记录该 CPU 上次更新阻塞负载的 `jiffies` 时间
+* `update_blocked_load_tick()` 把当前 `jiffies` 写入 `rq->last_blocked_load_update_tick` 更新记录
+* 之前 `update_nohz_stats()` 用到这个记录：如果还没到下一个更新周期，就跳过实际刷新，只返回“还有负载”让上层稍后再来
+```c
+static inline void update_blocked_load_tick(struct rq *rq)
+{
+    WRITE_ONCE(rq->last_blocked_load_update_tick, jiffies);
+}
+```
+##### `update_has_blocked_load_status()` 按需清除阻塞负载标志
+* 注意方向性：这里只会清 `0`，不会置 `1`
+  * 置 `1` 的责任在 `nohz_balance_enter_idle()`（CPU 进入空闲时）路径
+  * 这体现了 **悲观置位，乐观清零** 的策略：只要可能还有残留，就保持 `1`，直到一次完整更新确认干净了才清 `0`
+```c
+static inline void update_has_blocked_load_status(struct rq *rq, bool has_blocked_load)
+{
+    if (!has_blocked_load)
+        rq->has_blocked_load = 0;
+}
+```
+
+#### `__update_blocked_others()` 非 CFS 阻塞负载更新
+* `__update_blocked_others()` 是 PELT 阻塞负载更新流程中的 “非 CFS 前置处理站”
+  * 它先刷新 RT/DL/HW/IRQ 四类负载的统计值，汇报是否发生衰减
+  * 并标记是否还有残留，为后续 CFS 更新和 CPUFreq 调频提供准确的数据基础
+* `update_other_load_avgs()` 见 [PELT/其他负载更新函数 `update_other_load_avgs()` 函数](sched_pelt.md#其他负载更新函数-update_other_load_avgs-函数)
+* 注释解释了顺序依赖：
+  1. `update_other_load_avgs()` 内部可能调用 `cpufreq_update_util()`：当 RT/DL/IRQ 负载发生衰减时，会立即通知 schedutil 调速器重新评估频率
+  2. schedutil 计算频率时，依赖所有信号（包括 CFS）的准确值：如果先更新 CFS 再更新 RT，那么在 CFS 触发 `cpufreq_update_util()` 时，RT/DL/IRQ 的信号还是旧的，会导致频率计算偏低或偏高
+  3. 因此，必须先更新 RT/DL/IRQ/HW，让这些信号先“归位”，再更新 CFS。这样 CFS 触发的 `cpufreq_update_util()` 就能基于完整的、最新的信号做出正确的频率决策
+```c
+static bool __update_blocked_others(struct rq *rq, bool *done)
+{
+    bool updated;
+ 
+    /*
+     * update_load_avg() can call cpufreq_update_util(). Make sure that RT,
+     * DL and IRQ signals have been updated before updating CFS.
+     */
+    updated = update_other_load_avgs(rq);
+    //RT/DL/HW/IRQ 中还有非零值，就把 *done 置为 false，表示还有残留阻塞负载
+    if (others_have_blocked(rq))
+        *done = false;
+    //如果某个信号（如 RT）从非零衰减到 0，会返回 true  
+    return updated;
+}
+```
+##### `others_have_blocked()` 探测是否还有残留的其他阻塞负载
+* 该函数判断是否还有残留的其他阻塞负载
+  * 只要任何一项非零，就返回 `true`，表示 **有残留**
+  * 全部为零才返回 `false`，表示 **这一轮清干净了**
+* 注意：这里判断的是“是否大于 `0`”，而不是“是否发生了衰减”。即使负载很小，只要没衰减到 `0`，就认为还有残留
+```c
+static inline bool others_have_blocked(struct rq *rq)
+{   //该 CPU 上 RT（实时）任务 的 PELT 平均利用率。非零表示还有 RT 负载残留
+    if (cpu_util_rt(rq))
+        return true;
+    //该 CPU 上 DL（Deadline）任务 的 PELT 平均利用率
+    if (cpu_util_dl(rq))
+        return true;
+    //硬件反馈负载（如 Intel HWP、ARM DSU），反映硬件层面的压力
+    if (hw_load_avg(rq))
+        return true;
+    //IRQ（中断） 造成的 PELT 平均利用率
+    if (cpu_util_irq(rq))
+        return true;
+
+    return false;
+}
+```
+
+#### `__update_blocked_fair()` 阻塞负载更新
+* `__update_blocked_fair()` 是 PELT 阻塞负载更新流程中的 “CFS 处理站”
+  * 它用扣除 throttled 时间后的 PELT 时钟
+  * 更新整个 CFS 层级（含 cgroup）的负载平均值，汇报是否发生衰减
+  * 并标记是否还有残留负载，为 `has_blocked_load` 状态和 CPUFreq 调频提供准确的 CFS 侧数据
+
+##### 1. `cfs_rq_clock_pelt()` 计算 CFS 运行队列的 PELT 时钟
+* `cfs_rq->pelt_clock_throttled`：布尔标志，表示当前 `cfs_rq` **正处于 throttled 状态**
+* `cfs_rq->throttled_clock_pelt_time`：**累计** 被 throttled 的 PELT 时间总量（用于从主时钟中减去）
+* `cfs_rq->throttled_clock_pelt`：throttled **开始时刻** 的 PELT 时钟值（用于计算当前这次 throttled 已持续多久）
+* **情况 A**：正在被 throttled（`pelt_clock_throttled == 1`）
+  * 进入 throttled 那一刻的时钟 `throttled_clock_pelt` **减去** 之前累计的 throttled 时间 `throttled_clock_pelt_time`，得到扣掉历史 throttled 时间后的 PELT 时钟
+  * 注意：**当前** 这次 throttled 的时间没有被 **减掉** —— 因为在 throttled 期间，`cfs_rq` 不应该发生 PELT 衰减。用 throttle 开始时刻的时钟，正好“冻结”住时间轴
+* **情况 B**：正常运行（`pelt_clock_throttled == 0`）
+  * 用运行队列的实时 PELT 时钟，减去累计的 throttled 时间
+  * 得到的就是 **这个 `cfs_rq` 真正可运行的时间**
+* 减去 PELT 累计时间的原因：
+  * cgroup 带宽限制（`cpu.max`）会让 `cfs_rq` 在超出配额后被“强制休眠”一段时间
+  * 这段时间里，任务并没有真的在等待 CPU —— 是被人为限制的。如果把它算进 PELT，会导致负载值虚高，误导调度器
+  * 所以 PELT 时钟必须“跳过”throttled 期间，只统计真正可运行的时间
+```c
+/* rq->task_clock normalized against any time this cfs_rq has spent throttled */
+static inline u64 cfs_rq_clock_pelt(struct cfs_rq *cfs_rq)
+{
+    if (unlikely(cfs_rq->pelt_clock_throttled)) //正在被 throttled
+        return cfs_rq->throttled_clock_pelt - cfs_rq->throttled_clock_pelt_time;
+    
+    return rq_clock_pelt(rq_of(cfs_rq)) - cfs_rq->throttled_clock_pelt_time;
+}
+```
+##### 2. `cfs_rq_has_blocked_load()` 探测 CFS 是否有残留负载
+* `cfs_rq->avg.load_avg`：CFS 运行队列的 **负载平均值**（权重加权）。非零表示还有阻塞任务的负载残留
+* `cfs_rq->avg.util_avg`：CFS 运行队列的 **利用率平均值**（算力占用）。非零表示还有实际算力需求残留
+* 与 `others_have_blocked()` 的逻辑一致：只要有任何非零值，就认为 **还有残留**，返回 `true`
+* 为什么只检查 `load_avg` 和 `util_avg`？
+  * CFS 的核心指标就是这两个：`load_avg` 反映“有多少权重在等”，`util_avg` 反映“实际用了多少算力”
+  * `runnable_avg` 不单独检查，因为它要么被 `util_avg` 覆盖，要么已经通过 `load_avg` 体现
+```c
+static inline bool cfs_rq_has_blocked_load(struct cfs_rq *cfs_rq)
+{
+    if (cfs_rq->avg.load_avg)
+        return true;
+
+    if (cfs_rq->avg.util_avg)
+        return true;
+
+    return false;
+}
+```
+##### 3. `__update_blocked_fair()` CFS 阻塞负载更新入口
+* `update_cfs_rq_load_avg()` 是 CFS 负载的核心更新函数。它会：
+  * 对 `cfs_rq->avg.load_avg`、`util_avg`、`runnable_avg` 等做时间衰减
+  * 递归更新所有 `leaf_cfs_rq_list` 上的子 `cfs_rq`（cgroup 层级）
+  * 返回 `true` 表示发生了衰减（负载值变小了）
+  * 注意：虽然这里只传入了根 `cfs_rq`，但 `update_cfs_rq_load_avg()` 内部会通过 `leaf_cfs_rq_list` 遍历整个 cgroup 层级，所以所有子 `cfs_rq` 都会被更新到
+```c
+static bool __update_blocked_fair(struct rq *rq, bool *done)
+{
+    struct cfs_rq *cfs_rq = &rq->cfs;
+    bool decayed;
+    //更新根 cfs_rq 的 PELT 负载
+    decayed = update_cfs_rq_load_avg(cfs_rq_clock_pelt(cfs_rq), cfs_rq);
+    if (cfs_rq_has_blocked_load(cfs_rq)) //检查根 cfs_rq 是否还有残留负载
+        *done = false; //告诉上层 “CFS 这边阻塞负载还没清干净”
+    //返回衰减状态给上层，聚合后最终决定是否调用 cpufreq_update_util() 通知 schedutil 调速器降频
+    return decayed;
+}
+```
+
+#### 更新 CFS 运行队列负载平均值
+* `__signed_scalar_typeof()` 声明一个 **有符号** 的标量类型，无符号的标量类型转为有符号的，而非标量类型声明保持不变
+```c
+/*
+ * __signed_scalar_typeof(x) - Declare a signed scalar type, leaving
+ *                 non-scalar types unchanged.
+ */
+
+#define __scalar_type_to_signed_cases(type)             \
+        unsigned type:  (signed type)0,             \
+        signed type:    (signed type)0
+
+#define __signed_scalar_typeof(x) typeof(               \
+        _Generic((x),                       \
+             char:  (signed char)0,             \   
+             __scalar_type_to_signed_cases(char),       \
+             __scalar_type_to_signed_cases(short),      \   
+             __scalar_type_to_signed_cases(int),        \   
+             __scalar_type_to_signed_cases(long),       \   
+             __scalar_type_to_signed_cases(long long),  \
+             default: (x)))
+```
+* `add_positive()` 宏做有符号的加法，并做下溢保护
+```c
+/*
+ * Signed add and clamp on underflow.
+ *
+ * Explicitly do a load-store to ensure the intermediate value never hits
+ * memory. This allows lockless observations without ever seeing the negative
+ * values.
+ */
+#define add_positive(_ptr, _val) do {                           \
+    typeof(_ptr) ptr = (_ptr);                              \
+    __signed_scalar_typeof(*ptr) val = (_val);              \
+    typeof(*ptr) res, var = READ_ONCE(*ptr);                \
+                                \
+    res = var + val;                                        \
+                                \
+    if (val < 0 && res > var)                               \
+        res = 0;                                        \
+                                \
+    WRITE_ONCE(*ptr, res);                                  \
+} while (0)
+```
+1. `add_positive(&(sa)->name##_avg, delta_avg)` 把增量加到平均值上。`add_positive()` 内部会做 `*ptr += delta` 并处理溢出保护
+2. `add_positive(&(sa)->name##_sum, delta_sum)` 把增量加到总和上
+3. 下溢保护强制保证 `sum >= avg * PELT_MIN_DIVIDER`
+
+##### 为什么需要下界保护？
+> 由于舍入误差，单个调度实体（`se`）的 `util_sum` 可能比 `cfs_rq` 的 `util_sum` 多出 `1`。这本身不是问题，但如果在两次 `util_avg` 更新之间（约 `1ms`）连续分离大量有舍入问题的任务，就会导致 `cfs->util_sum` 变成 `0`，而 cfs_util_avg 却不为 `0`
+> 需要检查 `util_sum` 对于新的 `util_avg` 而言仍高于其下界。考虑到自上次同步后 `period_contrib` 可能已发生变化，我们仅能保证：`util_sum` 必须大于或等于 `util_avg * 最小可行除数`
+* 具体场景：
+  * 假设 1000 个小任务同时出队，每个任务的 `util_sum` 都因舍入比理论值大 `1`
+  * 累加扣除时，`cfs_rq->util_sum` 被多扣了 1000
+  * 结果 `util_sum` 变成负数或 `0`，但 `util_avg` 还是正值
+  * 这会让 PELT 的数学关系崩溃（`avg = sum / divider` 不再成立）
+* 解决方案：
+  * 每次更新后，强制 `sum >= avg * PELT_MIN_DIVIDER`
+  * `PELT_MIN_DIVIDER` 是 PELT 除数的最小可能值（对应最小时间窗口）
+  * 这样即使舍入误差累积，`sum` 也不会低于理论下界
+```c
+/*
+ * Because of rounding, se->util_sum might ends up being +1 more than
+ * cfs->util_sum. Although this is not a problem by itself, detaching
+ * a lot of tasks with the rounding problem between 2 updates of
+ * util_avg (~1ms) can make cfs->util_sum becoming null whereas
+ * cfs_util_avg is not.
+ *  
+ * Check that util_sum is still above its lower bound for the new
+ * util_avg. Given that period_contrib might have moved since the last
+ * sync, we are only sure that util_sum must be above or equal to
+ *    util_avg * minimum possible divider
+ */     
+#define __update_sa(sa, name, delta_avg, delta_sum) do {    \
+    add_positive(&(sa)->name##_avg, delta_avg);     \
+    add_positive(&(sa)->name##_sum, delta_sum);     \
+    (sa)->name##_sum = max_t(typeof((sa)->name##_sum),  \
+                   (sa)->name##_sum,        \
+                   (sa)->name##_avg * PELT_MIN_DIVIDER); \
+} while (0)
+```
+##### `add_tg_cfs_propagate()` 标记任务组需要传播
+```c
+static inline void add_tg_cfs_propagate(struct cfs_rq *cfs_rq, long runnable_sum)
+{
+    cfs_rq->propagate = 1;
+    cfs_rq->prop_runnable_sum += runnable_sum;
+}
+```
+##### `update_cfs_rq_load_avg()` 更新 CFS 运行队列负载平均值
+```c
+/**
+ * update_cfs_rq_load_avg - update the cfs_rq's load/util averages
+ * @now: current time, as per cfs_rq_clock_pelt()
+ * @cfs_rq: cfs_rq to update
+ *
+ * The cfs_rq avg is the direct sum of all its entities (blocked and runnable)
+ * avg. The immediate corollary is that all (fair) tasks must be attached.
+ *
+ * cfs_rq->avg is used for task_h_load() and update_cfs_share() for example.
+ *
+ * Return: true if the load decayed or we removed load.
+ *
+ * Since both these conditions indicate a changed cfs_rq->avg.load we should
+ * call update_tg_load_avg() when this function returns true.
+ */
+static inline int 
+update_cfs_rq_load_avg(u64 now, struct cfs_rq *cfs_rq)
+{   
+    unsigned long removed_load = 0, removed_util = 0, removed_runnable = 0;
+    struct sched_avg *sa = &cfs_rq->avg;
+    int decayed = 0;
+
+    if (cfs_rq->removed.nr) {
+        unsigned long r;
+        u32 divider = get_pelt_divider(&cfs_rq->avg);
+
+        raw_spin_lock(&cfs_rq->removed.lock);
+        swap(cfs_rq->removed.util_avg, removed_util);
+        swap(cfs_rq->removed.load_avg, removed_load);
+        swap(cfs_rq->removed.runnable_avg, removed_runnable);
+        cfs_rq->removed.nr = 0;
+        raw_spin_unlock(&cfs_rq->removed.lock);
+
+        r = removed_load;
+        __update_sa(sa, load, -r, -r*divider);
+
+        r = removed_util;
+        __update_sa(sa, util, -r, -r*divider);
+
+        r = removed_runnable;
+        __update_sa(sa, runnable, -r, -r*divider);
+
+        /*
+         * removed_runnable is the unweighted version of removed_load so we
+         * can use it to estimate removed_load_sum.
+         */
+        add_tg_cfs_propagate(cfs_rq,
+            -(long)(removed_runnable * divider) >> SCHED_CAPACITY_SHIFT);
+
+        decayed = 1;
+    }
+
+    decayed |= __update_load_avg_cfs_rq(now, cfs_rq);
+    u64_u32_store_copy(sa->last_update_time,
+               cfs_rq->last_update_time_copy,
+               sa->last_update_time);
+    return decayed;
+}
+```
+
 ### CPU 进入 NOHZ 空闲状态时设置的负载均衡相关信息
 ```cpp
 static void set_cpu_sd_state_idle(int cpu)
@@ -1038,7 +1368,7 @@ void nohz_balance_enter_idle(int cpu)
         rq->nohz_tick_stopped = 1;
         //将该 CPU 加入全局 NOHZ 空闲 CPU 掩码。从此以后，find_new_ilb() 和 _nohz_idle_balance() 都会遍历到这个 CPU
         cpumask_set_cpu(cpu, nohz.idle_cpus_mask);
-        //作用：确保 idle_cpus_mask 的设置（原子操作）先于后续的 has_blocked_load 和 needs_update 写入对其他 CPU 可见
+        //屏障的作用：确保 idle_cpus_mask 的设置（原子操作）先于后续的 has_blocked_load 和 needs_update 写入对其他 CPU 可见
         //如果 _nohz_idle_balance() 没有观察到 idle_cpus_mask 的写入（即没遍历到这个 CPU），
         //那么它一定能观察到后续的 has_blocked_load 和 needs_update 写入。这样保证了这个 CPU
         //不会“两头落空”——要么被遍历到，要么被标志位唤醒
